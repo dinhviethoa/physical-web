@@ -17,6 +17,7 @@
 import webapp2
 import json
 import logging
+import time
 from datetime import datetime, timedelta
 from google.appengine.ext import ndb
 from google.appengine.api import taskqueue
@@ -31,7 +32,7 @@ from google.appengine.api import urlfetch_errors
 
 class BaseModel(ndb.Model):
     added_on = ndb.DateTimeProperty(auto_now_add = True)
-    updated_on = ndb.DateTimeProperty(auto_now = True)
+    updated_on = ndb.DateTimeProperty()
 
 class SiteInformation(BaseModel):
     url = ndb.TextProperty()
@@ -39,6 +40,10 @@ class SiteInformation(BaseModel):
     title = ndb.TextProperty()
     description = ndb.TextProperty()
     jsonlds = ndb.TextProperty()
+    clicks = ndb.IntegerProperty()
+    views = ndb.IntegerProperty()
+    duration = ndb.FloatProperty()
+    clicked_on = ndb.DateTimeProperty()
 
 class DemoMetadata(webapp2.RequestHandler):
     def get(self):
@@ -84,6 +89,13 @@ class ResolveScan(webapp2.RequestHandler):
 class GoUrl(webapp2.RequestHandler):
     def get(self):
         url = self.request.get('url')
+        siteInfo = SiteInformation.get_by_id(url)
+        count = siteInfo.clicks
+        if count is None:
+            count = 0
+        siteInfo.clicks = count + 1
+        siteInfo.clicked_on = datetime.now()
+        siteInfo.put()
         url = url.encode('ascii','ignore')
         self.redirect(url)
 
@@ -125,10 +137,19 @@ def BuildResponse(objects):
                     siteInfo = FetchAndStoreUrl(siteInfo, url)
                 if siteInfo is not None and siteInfo.updated_on < datetime.now() - timedelta(minutes=5):
                     # Updated time to make sure we don't request twice.
+                    siteInfo.updated_on = datetime.now()
                     siteInfo.put()
                     # Add request to queue.
                     taskqueue.add(url='/refresh-url', params={'url': url})
 
+            score = ComputeScore(obj, siteInfo)
+
+            count = siteInfo.views
+            if count is None:
+                count = 0
+            siteInfo.views = count + 1
+            siteInfo.put()
+            logging.info(count)
             device_data = {};
             if siteInfo is not None:
                 device_data["id"] = url
@@ -144,17 +165,81 @@ def BuildResponse(objects):
             else:
                 device_data["id"] = url
                 device_data["url"] = url
+            device_data["score"] = str(score)
+            if "rssi" in obj and "tx" in obj:
+                device_data["distance_score"] = str(ComputeDistanceScore(obj))
+            device_data["ctr_score"] = str(ComputeClickRateScore(siteInfo))
+            device_data["speed_score"] = str(ComputeSiteSpeedScore(siteInfo))
+            device_data["last_click_score"] = str(ComputeSiteLastClickScore(siteInfo))
 
             metadata_output.append(device_data)
 
         return metadata_output
 
+def ComputeDistanceScore(obj):
+    rssi = int(obj["rssi"])
+    tx = int(obj["tx"])
+    if rssi == 127:
+        return 0.5
+    path_loss = tx - rssi
+    distance = pow(10.0, path_loss - 41)
+    if distance < 1.0:
+        return 1.0
+    if distance < 5.0:
+        return 0.6
+    else:
+        return 0.0
+
+def ComputeClickRateScore(siteInfo):
+    logging.info("clicks: " + str(siteInfo.clicks) + " " + str(siteInfo.views))
+    if siteInfo.clicks is None:
+        return 0.0
+    if siteInfo.views is None:
+        return 0.5
+    value = float(siteInfo.clicks) / float(siteInfo.views)
+    if value > 0.1:
+        return 1.0
+    else:
+        return value
+
+def ComputeSiteSpeedScore(siteInfo):
+    if siteInfo.duration is None:
+        return 0.5
+    if siteInfo.duration > 3.0:
+        return 0
+    return (3.0 - siteInfo.duration) / 3.0
+
+def ComputeSiteLastClickScore(siteInfo):
+    if siteInfo.clicked_on is None:
+        return 0.0
+    c = datetime.now() - siteInfo.clicked_on
+    if c.days > 7:
+        return 0.0
+    else:
+        return (7 - float(c.days)) / 7.0
+
+def ComputeScore(obj, siteInfo):
+    # distance 0 -> 5
+    distance_score = 2.5
+    if "rssi" in obj and "tx" in obj:
+        distance_score = ComputeDistanceScore(obj) * 5;
+    # click rate 0 -> 10
+    click_score = ComputeClickRateScore(siteInfo) * 5
+    # slow website 0 -> 2
+    speed_score = ComputeSiteSpeedScore(siteInfo) * 2
+    # last click date 0 -> 2
+    last_click_score = ComputeSiteLastClickScore(siteInfo) * 2
+    return distance_score + click_score + speed_score + last_click_score
+
 def FetchAndStoreUrl(siteInfo, url):
     # Index the page
+    fetch_start_time = time.clock();
     try:
         result = urlfetch.fetch(url, validate_certificate = True)
     except:
         return StoreInvalidUrl(siteInfo, url)
+    fetch_end_time = time.clock();
+    duration = fetch_end_time - fetch_start_time
 
     if result.status_code == 200:
         encoding = GetContentEncoding(result.content)
@@ -162,7 +247,7 @@ def FetchAndStoreUrl(siteInfo, url):
         real_final_url = result.final_url
         if real_final_url is None:
             real_final_url = final_url
-        return StoreUrl(siteInfo, url, final_url, real_final_url, result.content, encoding)
+        return StoreUrl(siteInfo, url, final_url, real_final_url, result.content, encoding, duration)
     else:
         return StoreInvalidUrl(siteInfo, url)
 
@@ -226,14 +311,16 @@ def StoreInvalidUrl(siteInfo, url):
             title = None,
             favicon_url = None,
             description = None,
-            jsonlds = None)
+            jsonlds = None,
+            updated_on = datetime.now())
     else:
         # Don't update if it was already cached.
+        siteInfo.updated_on = datetime.now()
         siteInfo.put()
 
     return siteInfo
 
-def StoreUrl(siteInfo, url, final_url, real_final_url, content, encoding):
+def StoreUrl(siteInfo, url, final_url, real_final_url, content, encoding, duration):
     title = None
     description = None
     icon = None
@@ -371,7 +458,9 @@ def StoreUrl(siteInfo, url, final_url, real_final_url, content, encoding):
             title = title,
             favicon_url = icon,
             description = description,
-            jsonlds = jsonlds_data)
+            jsonlds = jsonlds_data,
+            updated_on = datetime.now(),
+            duration = duration)
     else:
         # update the data because it already exists
         siteInfo.url = final_url
@@ -379,6 +468,8 @@ def StoreUrl(siteInfo, url, final_url, real_final_url, content, encoding):
         siteInfo.favicon_url = icon
         siteInfo.description = description
         siteInfo.jsonlds = jsonlds_data
+        siteInfo.updated_on = datetime.now()
+        siteInfo.duration = duration
         siteInfo.put()
     
     return siteInfo
